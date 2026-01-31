@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 
 const SUITS = ["hearts", "diamonds", "clubs", "spades"];
 const VALUES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"];
@@ -37,7 +37,6 @@ function calculateHandValue(hand) {
     if (card.value === "A") aces++;
   }
 
-  // Convert aces from 11 to 1 as needed to avoid busting
   while (value > 21 && aces > 0) {
     value -= 10;
     aces--;
@@ -56,10 +55,17 @@ export function useBlackjack(initialCoins = 0) {
   const [playerHand, setPlayerHand] = useState([]);
   const [dealerHand, setDealerHand] = useState([]);
   const [bet, setBet] = useState(0);
-  const [gameState, setGameState] = useState("idle"); // idle, betting, playing, dealer_turn, finished
-  const [result, setResult] = useState(null); // win, lose, push, blackjack
+  const [gameState, setGameState] = useState("idle");
+  const [result, setResult] = useState(null);
   const [coins, setCoins] = useState(initialCoins);
   const [message, setMessage] = useState("");
+
+  // Track pending outcomes that UI will trigger after animations
+  const [pendingOutcome, setPendingOutcome] = useState(null); // 'player_blackjack', 'dealer_blackjack', 'push_blackjack'
+
+  // Use refs for dealer drawing to avoid stale closures
+  const deckRef = useRef([]);
+  const dealerHandRef = useRef([]);
 
   const updateCoins = useCallback((newCoins) => {
     setCoins(newCoins);
@@ -72,6 +78,9 @@ export function useBlackjack(initialCoins = 0) {
     setDealerHand([]);
     setResult(null);
     setMessage("");
+    setPendingOutcome(null);
+    deckRef.current = [];
+    dealerHandRef.current = [];
   }, []);
 
   const deal = useCallback(
@@ -85,6 +94,9 @@ export function useBlackjack(initialCoins = 0) {
       const playerCards = [newDeck.pop(), newDeck.pop()];
       const dealerCards = [newDeck.pop(), newDeck.pop()];
 
+      deckRef.current = newDeck;
+      dealerHandRef.current = dealerCards;
+
       setDeck(newDeck);
       setPlayerHand(playerCards);
       setDealerHand(dealerCards);
@@ -92,132 +104,147 @@ export function useBlackjack(initialCoins = 0) {
       setCoins((prev) => prev - betAmount);
       setMessage("");
 
-      // Check for player blackjack
+      // Check for blackjacks - but don't finish yet, let UI handle after animation
       if (isBlackjack(playerCards)) {
         if (isBlackjack(dealerCards)) {
-          // Both have blackjack - push
-          setResult("push");
-          setCoins((prev) => prev + betAmount);
-          setMessage("Both have Blackjack! Push.");
-          setGameState("finished");
+          setPendingOutcome('push_blackjack');
         } else {
-          // Player blackjack wins 3:2
-          const winnings = betAmount + Math.floor(betAmount * 1.5);
-          setResult("blackjack");
-          setCoins((prev) => prev + winnings);
-          setMessage(`Blackjack! You win ${winnings} coins!`);
-          setGameState("finished");
+          setPendingOutcome('player_blackjack');
         }
       } else if (isBlackjack(dealerCards)) {
-        // Dealer blackjack
-        setResult("lose");
-        setMessage("Dealer has Blackjack! You lose.");
-        setGameState("finished");
-      } else {
-        setGameState("playing");
+        setPendingOutcome('dealer_blackjack');
       }
+
+      // Always go to playing first - UI will check pendingOutcome after deal animation
+      setGameState("playing");
     },
     [coins]
   );
 
-  const hit = useCallback(() => {
-    if (gameState !== "playing") return;
+  // Called by UI after animation when there's a blackjack
+  const finishBlackjack = useCallback(() => {
+    if (pendingOutcome === 'push_blackjack') {
+      setResult("push");
+      setCoins((prev) => prev + bet);
+      setMessage("Both have Blackjack! Push.");
+    } else if (pendingOutcome === 'player_blackjack') {
+      const winnings = bet + Math.floor(bet * 1.5);
+      setResult("blackjack");
+      setCoins((prev) => prev + winnings);
+      setMessage(`Blackjack! You win ${winnings} coins!`);
+    } else if (pendingOutcome === 'dealer_blackjack') {
+      setResult("lose");
+      setMessage("Dealer has Blackjack! You lose.");
+    }
+    setPendingOutcome(null);
+    setGameState("finished");
+  }, [pendingOutcome, bet]);
 
-    const newDeck = [...deck];
+  // Just add one card - returns hand value for UI to check
+  const hit = useCallback(() => {
+    if (gameState !== "playing" || pendingOutcome) return null;
+
+    const newDeck = [...deckRef.current];
     const newCard = newDeck.pop();
     const newHand = [...playerHand, newCard];
 
+    deckRef.current = newDeck;
     setDeck(newDeck);
     setPlayerHand(newHand);
 
-    const handValue = calculateHandValue(newHand);
-    if (handValue > 21) {
-      setResult("lose");
-      setMessage("Bust! You lose.");
-      setGameState("finished");
-    } else if (handValue === 21) {
-      // Auto-stand on 21
-      dealerTurn(newDeck, dealerHand, newHand);
+    return calculateHandValue(newHand);
+  }, [gameState, playerHand, pendingOutcome]);
+
+  // Called by UI after animation delay when player busts
+  const finishBust = useCallback(() => {
+    setResult("lose");
+    setMessage("Bust! You lose.");
+    setGameState("finished");
+  }, []);
+
+  // Called by UI to start dealer turn
+  const startDealerTurn = useCallback(() => {
+    setGameState("dealer_turn");
+  }, []);
+
+  // Draw one dealer card using refs to avoid stale closure
+  // Returns: { drew: boolean, needsMore: boolean }
+  const dealerDrawOne = useCallback(() => {
+    const currentHand = dealerHandRef.current;
+    const currentDeck = deckRef.current;
+    const dealerValue = calculateHandValue(currentHand);
+
+    if (dealerValue >= 17) {
+      return { drew: false, needsMore: false };
     }
-  }, [gameState, deck, playerHand, dealerHand]);
 
-  const dealerTurn = useCallback(
-    (currentDeck, currentDealerHand, currentPlayerHand) => {
-      setGameState("dealer_turn");
-      let newDeck = [...currentDeck];
-      let newDealerHand = [...currentDealerHand];
+    const newCard = currentDeck.pop();
+    const newHand = [...currentHand, newCard];
 
-      // Dealer hits until 17 or higher
-      while (calculateHandValue(newDealerHand) < 17) {
-        newDealerHand.push(newDeck.pop());
-      }
+    dealerHandRef.current = newHand;
+    deckRef.current = currentDeck;
 
-      setDeck(newDeck);
-      setDealerHand(newDealerHand);
+    setDeck([...currentDeck]);
+    setDealerHand(newHand);
 
-      const playerValue = calculateHandValue(currentPlayerHand);
-      const dealerValue = calculateHandValue(newDealerHand);
+    const newValue = calculateHandValue(newHand);
+    return { drew: true, needsMore: newValue < 17 };
+  }, []);
 
-      if (dealerValue > 21) {
-        const winnings = bet * 2;
-        setResult("win");
-        setCoins((prev) => prev + winnings);
-        setMessage(`Dealer busts! You win ${winnings} coins!`);
-      } else if (playerValue > dealerValue) {
-        const winnings = bet * 2;
-        setResult("win");
-        setCoins((prev) => prev + winnings);
-        setMessage(`You win ${winnings} coins!`);
-      } else if (playerValue < dealerValue) {
-        setResult("lose");
-        setMessage("Dealer wins. You lose.");
-      } else {
-        setResult("push");
-        setCoins((prev) => prev + bet);
-        setMessage("Push! Bet returned.");
-      }
+  // Finish the round after dealer is done drawing
+  const finishRound = useCallback(() => {
+    const playerValue = calculateHandValue(playerHand);
+    const dealerValue = calculateHandValue(dealerHandRef.current);
 
-      setGameState("finished");
-    },
-    [bet]
-  );
+    if (dealerValue > 21) {
+      const winnings = bet * 2;
+      setResult("win");
+      setCoins((prev) => prev + winnings);
+      setMessage(`Dealer busts! You win ${winnings} coins!`);
+    } else if (playerValue > dealerValue) {
+      const winnings = bet * 2;
+      setResult("win");
+      setCoins((prev) => prev + winnings);
+      setMessage(`You win ${winnings} coins!`);
+    } else if (playerValue < dealerValue) {
+      setResult("lose");
+      setMessage("Dealer wins. You lose.");
+    } else {
+      setResult("push");
+      setCoins((prev) => prev + bet);
+      setMessage("Push! Bet returned.");
+    }
+
+    setGameState("finished");
+  }, [bet, playerHand]);
 
   const stand = useCallback(() => {
-    if (gameState !== "playing") return;
-    dealerTurn(deck, dealerHand, playerHand);
-  }, [gameState, deck, dealerHand, playerHand, dealerTurn]);
+    if (gameState !== "playing" || pendingOutcome) return;
+    setGameState("dealer_turn");
+  }, [gameState, pendingOutcome]);
 
   const doubleDown = useCallback(() => {
-    if (gameState !== "playing") return;
-    if (playerHand.length !== 2) return;
+    if (gameState !== "playing" || pendingOutcome) return null;
+    if (playerHand.length !== 2) return null;
     if (bet > coins) {
       setMessage("Not enough coins to double down");
-      return;
+      return null;
     }
 
-    // Double the bet
     const additionalBet = bet;
     setCoins((prev) => prev - additionalBet);
     setBet((prev) => prev * 2);
 
-    // Take exactly one more card
-    const newDeck = [...deck];
+    const newDeck = [...deckRef.current];
     const newCard = newDeck.pop();
     const newHand = [...playerHand, newCard];
 
+    deckRef.current = newDeck;
     setDeck(newDeck);
     setPlayerHand(newHand);
 
-    const handValue = calculateHandValue(newHand);
-    if (handValue > 21) {
-      setResult("lose");
-      setMessage("Bust! You lose.");
-      setGameState("finished");
-    } else {
-      // Automatically stand after double down
-      dealerTurn(newDeck, dealerHand, newHand);
-    }
-  }, [gameState, playerHand, bet, coins, deck, dealerHand, dealerTurn]);
+    return calculateHandValue(newHand);
+  }, [gameState, playerHand, bet, coins, pendingOutcome]);
 
   const reset = useCallback(() => {
     setDeck([]);
@@ -227,6 +254,9 @@ export function useBlackjack(initialCoins = 0) {
     setGameState("idle");
     setResult(null);
     setMessage("");
+    setPendingOutcome(null);
+    deckRef.current = [];
+    dealerHandRef.current = [];
   }, []);
 
   return {
@@ -240,6 +270,7 @@ export function useBlackjack(initialCoins = 0) {
     message,
     playerValue: calculateHandValue(playerHand),
     dealerValue: calculateHandValue(dealerHand),
+    pendingOutcome,
 
     // Actions
     updateCoins,
@@ -250,7 +281,14 @@ export function useBlackjack(initialCoins = 0) {
     doubleDown,
     reset,
 
+    // Animation-aware actions (called by UI after delays)
+    finishBlackjack,
+    finishBust,
+    startDealerTurn,
+    dealerDrawOne,
+    finishRound,
+
     // Helpers
-    canDoubleDown: gameState === "playing" && playerHand.length === 2 && bet <= coins,
+    canDoubleDown: gameState === "playing" && playerHand.length === 2 && bet <= coins && !pendingOutcome,
   };
 }

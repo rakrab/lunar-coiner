@@ -1,7 +1,7 @@
 mod commands;
 mod save_file;
 
-use commands::{get_steam_profiles, load_profile, save_coins};
+use commands::{debug_paths, get_steam_profiles, load_profile, save_coins};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -11,7 +11,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_steam_profiles,
             load_profile,
-            save_coins
+            save_coins,
+            debug_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
